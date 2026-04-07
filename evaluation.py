@@ -617,6 +617,7 @@ def eval_exec_match(db, p_str, g_str, pred, gold):
     in the corresponding index. Currently not support multiple col_unit(pairs).
     """
     conn = sqlite3.connect(db)
+    conn.text_factory = lambda b: b.decode(errors='ignore')
     cursor = conn.cursor()
     try:
         cursor.execute(p_str)
