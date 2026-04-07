@@ -13,9 +13,9 @@ TABLES_JSON = "spider_data/tables.json"
 
 # List of the predicted files generated in Phase 3
 MODELS_TO_EVALUATE = [
-    {"name": "Gemini 2.5 Flash", "file": "predicted_gemini.txt"},
+    {"name": "Gemini 3.1 Flash Lite", "file": "predicted_gemini.txt"},
     {"name": "Llama 3 (70B)", "file": "predicted_llama.txt"},
-    {"name": "Mistral (8x7B)", "file": "predicted_mistral.txt"}
+    {"name": "Qwen (32B)", "file": "predicted_qwen.txt"}
 ]
 
 # ==========================================
@@ -24,7 +24,7 @@ MODELS_TO_EVALUATE = [
 def parse_spider_output(output_text):
     """
     Reads the raw terminal text output from the Spider evaluation script
-    and extracts the final 'ALL' scores for Execution and Exact Match.
+    and extracts the final 'all' scores from the last column of the table.
     """
     ex_score = "Error"
     em_score = "Error"
@@ -37,11 +37,19 @@ def parse_spider_output(output_text):
             current_section = "EX"
         elif "EXACT MATCH" in line:
             current_section = "EM"
-        elif line.startswith("ALL:") and current_section == "EX":
-            ex_score = line.split(":")[1].strip()
-        elif line.startswith("ALL:") and current_section == "EM":
-            em_score = line.split(":")[1].strip()
             
+        # O Spider imprime linhas como: "execution  0.800  0.700  0.600  0.500  0.650"
+        # A última coluna é a média geral ("all")
+        elif current_section == "EX" and line.startswith("execution"):
+            parts = line.split()
+            if len(parts) >= 6:
+                ex_score = parts[-1].strip()
+                
+        elif current_section == "EM" and line.startswith("exact"):
+            parts = line.split()
+            if len(parts) >= 6:
+                em_score = parts[-1].strip()
+                
     return ex_score, em_score
 
 # ==========================================
@@ -54,7 +62,7 @@ def run_spider_evaluator(prediction_file):
     """
     # CORRIGIDO: Removido o 'command =' duplicado
     command = [
-        sys.executable, "evaluation.py",
+        sys.executable, "-X", "utf8", "evaluation.py",
         "--gold", GOLD_SQL_FILE,
         "--pred", prediction_file,
         "--etype", "all",
@@ -64,7 +72,7 @@ def run_spider_evaluator(prediction_file):
     
     try:
         # Run the command
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", check=True)
         return parse_spider_output(result.stdout)
     except subprocess.CalledProcessError as e:
         print(f"\n[!] Failed to evaluate {prediction_file}. Error details:")
