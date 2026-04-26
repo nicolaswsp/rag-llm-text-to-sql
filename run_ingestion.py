@@ -14,70 +14,65 @@ google_api_key = os.getenv("GOOGLE_API_KEY")
 if not google_api_key:
     raise ValueError("A chave GOOGLE_API_KEY não foi encontrada no arquivo .env!")
 
-# Caminho onde os bancos de dados do Spider estão salvos localmente
-# Ajuste se a sua pasta se chamar diferente de "spider_data/database"
 SPIDER_DB_FOLDER = "spider_data/database"
 
 # ==========================================
 # 2. Configuração do ChromaDB + Gemini
 # ==========================================
-print("⏳ Configurando o motor de embeddings do Google (text-embedding-004)...")
+print("⏳ Configurando o motor de embeddings do Google (gemini-embedding-001)...")
 google_ef = embedding_functions.GoogleGenerativeAiEmbeddingFunction(
     api_key=google_api_key,
     model_name="models/gemini-embedding-001",
-    task_type="RETRIEVAL_DOCUMENT" # Indica ao modelo que estamos armazenando conhecimento
+    task_type="RETRIEVAL_DOCUMENT"
 )
 
-# Criando/Conectando ao banco vetorial com o novo nome para não apagar o antigo
 print("📂 Conectando ao ChromaDB (path: ./spider_rag_db_gemini)...")
 chroma_client = chromadb.PersistentClient(path="./spider_rag_db_gemini")
 
-# Criando a coleção com o motor do Google atrelado
 schema_collection = chroma_client.get_or_create_collection(
     name="spider_schemas",
     embedding_function=google_ef
 )
 
 # ==========================================
-# 3. Função de Leitura dos Dados do Spider
+# 3. Função de Leitura Limpa (Anti-Poluição)
 # ==========================================
-def read_schema_from_sql(db_id):
+def read_schema_clean(db_id):
     """
-    Tenta ler o arquivo 'schema.sql'. Se ele não existir, 
-    conecta no arquivo binário '.sqlite' e faz engenharia reversa do DDL.
+    Extrai APENAS a estrutura DDL. 
+    Ignora os comandos INSERT para economizar tokens e evitar arquivos de 50MB.
     """
     db_folder = os.path.join(SPIDER_DB_FOLDER, db_id)
-    schema_txt_path = os.path.join(db_folder, "schema.sql")
     sqlite_db_path = os.path.join(db_folder, f"{db_id}.sqlite")
+    schema_txt_path = os.path.join(db_folder, "schema.sql")
 
-    # Tentativa 1: Existe o arquivo de texto schema.sql?
-    if os.path.exists(schema_txt_path):
-        try:
-            with open(schema_txt_path, "r", encoding="utf-8") as f:
-                return f.read()
-        except UnicodeDecodeError:
-            pass # Se der erro de codificação, pula para a tentativa 2
-
-    # Tentativa 2: Extração direta do banco .sqlite (Engenharia Reversa)
+    # Tentativa 1: Extração direta do banco .sqlite (Limpo e Seguro)
     if os.path.exists(sqlite_db_path):
         try:
             conn = sqlite3.connect(sqlite_db_path)
             cursor = conn.cursor()
-            
-            # Consulta a tabela interna do SQLite que guarda como o banco foi criado
             cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
             tables = cursor.fetchall()
             conn.close()
             
-            # Junta todos os comandos CREATE TABLE em um único texto
             ddl_reverso = "\n\n".join([t[0] for t in tables if t[0] is not None])
-            
             if ddl_reverso.strip():
                 return ddl_reverso
-                
-        except Exception as e:
-            print(f"Erro interno ao ler o sqlite do banco '{db_id}': {e}")
+        except Exception:
+            pass # Se falhar, tenta o texto
+
+    # Tentativa 2: Lendo o arquivo de texto, mas excluindo os INSERTs
+    if os.path.exists(schema_txt_path):
+        try:
+            with open(schema_txt_path, "r", encoding="utf-8") as f:
+                linhas = f.readlines()
             
+            # Mantém apenas as linhas que não começam com INSERT
+            linhas_limpas = [linha for linha in linhas if not linha.strip().upper().startswith("INSERT")]
+            return "".join(linhas_limpas)
+        except UnicodeDecodeError:
+            pass
+
     return None
 
 # ==========================================
@@ -90,34 +85,33 @@ def main():
         print(f"Erro: A pasta '{SPIDER_DB_FOLDER}' não foi encontrada.")
         return
 
-    # Lista todas as pastas de banco de dados do Spider
     db_folders = [f.name for f in os.scandir(SPIDER_DB_FOLDER) if f.is_dir()]
     
     documents = []
     metadatas = []
     ids = []
 
-    print(f"Varrendo {len(db_folders)} bancos de dados e extraindo DDLs...")
+    print(f"Varrendo {len(db_folders)} bancos de dados e extraindo DDLs limpos...")
 
     for db_id in db_folders:
-        ddl_content = read_schema_from_sql(db_id)
+        ddl_content = read_schema_clean(db_id)
 
         if ddl_content:
             documents.append(ddl_content)
             metadatas.append({"db_id": db_id})
-            ids.append(db_id) # Usamos o próprio nome do banco como ID único
+            ids.append(db_id)
         else:
-            print(f"Aviso: schema.sql não encontrado para o banco '{db_id}'.")
+            print(f"Aviso: Não foi possível extrair esquema para o banco '{db_id}'.")
 
     # ==========================================
-    # 5. Salvando no Banco Vetorial em Lotes
+    # 5. Salvando no Banco Vetorial (Um a Um)
     # ==========================================
     if documents:
         print(f"\nTransformando {len(documents)} schemas em vetores e salvando no ChromaDB...")
         
-        # Reduzimos o lote para 5, pois DDLs são pesados e gastam muitos Tokens
-        batch_size = 5 
-        total_batches = (len(documents) // batch_size) + 1
+        # Lote reduzido para 1 para evitar estouro de limite
+        batch_size = 1 
+        total_batches = len(documents)
 
         for i in range(0, len(documents), batch_size):
             doc_batch = documents[i : i + batch_size]
@@ -125,35 +119,41 @@ def main():
             id_batch = ids[i : i + batch_size]
 
             sucesso = False
-            while not sucesso:
+            tentativas = 0
+            max_tentativas = 3
+
+            while not sucesso and tentativas < max_tentativas:
                 try:
-                    # Tenta inserir no banco de dados
                     schema_collection.upsert(
                         documents=doc_batch,
                         metadatas=meta_batch,
                         ids=id_batch
                     )
-                    sucesso = True # Se passou da linha de cima sem erro, deu certo!
-                    lote_atual = (i // batch_size) + 1
-                    print(f"Lote {lote_atual}/{total_batches} processado com sucesso.")
+                    sucesso = True 
+                    print(f"✅ Banco {i + 1}/{total_batches} ({id_batch[0]}) vetorizado com sucesso.")
                     
-                    # Pausa leve de 15 segundos entre os lotes para não assustar o servidor
-                    time.sleep(15) 
+                    # Pausa leve entre bancos para a API respirar
+                    time.sleep(2) 
 
                 except Exception as e:
                     error_msg = str(e)
-                    # Se o erro for o 429 (Rate Limit / Quota Exceeded)
                     if "429" in error_msg or "Quota" in error_msg or "ResourceExhausted" in error_msg:
-                        print(f"Limite do Google atingido no Lote {(i // batch_size) + 1}. Pausando por 60 segundos para recarregar a cota...")
-                        time.sleep(60) # Espera 1 minuto inteiro
+                        tentativas += 1
+                        print(f"⏳ Limite atingido no banco '{id_batch[0]}'. Tentativa {tentativas}/{max_tentativas}. Pausando por 60 segundos...")
+                        time.sleep(60) 
                     else:
-                        # Se for um erro diferente, ele avisa e para o loop
-                        print(f"Erro desconhecido no Lote {(i // batch_size) + 1}: {e}")
+                        print(f"❌ Erro desconhecido no banco '{id_batch[0]}': {e}")
                         break
 
-        print("\nFase 2 concluída com sucesso!")
-        print("Seu RAG agora possui um cérebro semântico novinho em folha criado pelo Google.")
+            # Se falhou 3 vezes seguidas, a cota diária acabou. Interrompe o processo.
+            if not sucesso:
+                print("\n⛔ O script parou para evitar loops infinitos. É provável que sua cota diária de tokens tenha zerado.")
+                print("Tente rodar novamente amanhã ou utilize uma nova chave de API.")
+                return
+
+        print("\n🎉 Fase 2 concluída com sucesso! Banco RAG montado.")
     else:
         print("\nNenhum schema válido foi encontrado para indexar.")
+
 if __name__ == "__main__":
     main()
