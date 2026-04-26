@@ -6,28 +6,33 @@ import sys
 # ==========================================
 # 1. Configuration Paths
 # ==========================================
-# Make sure these match the location of your Spider dataset files
 GOLD_SQL_FILE = "spider_data/dev_gold.sql"
 DB_FOLDER = "spider_data/database/"
 TABLES_JSON = "spider_data/tables.json"
 
-# List of the predicted files generated in Phase 3
+# MAPEAMENTO ATUALIZADO: Todos os seus 8 arquivos do Estudo de Ablação
 MODELS_TO_EVALUATE = [
-    {"name": "Gemini 3.1 Flash Lite", "file": "predicted_gemini.txt"},
-    {"name": "Llama 3 (70B)", "file": "predicted_llama.txt"},
-    {"name": "Qwen (32B)", "file": "predicted_qwen.txt"}
+    {"name": "Llama 3.3 (Sem RAG)", "file": "predicted_llama_rag_none.txt"},
+    {"name": "Llama 3.3 (Com RAG)", "file": "predicted_llama_rag_default.txt"},
+    {"name": "Qwen 3 (Sem RAG)", "file": "predicted_qwen_rag_none.txt"},
+    {"name": "Qwen 3 (Com RAG)", "file": "predicted_qwen_rag_default.txt"},
+    {"name": "Gemini Flash (Sem RAG)", "file": "predicted_gemini_flash_rag_none.txt"},
+    {"name": "Gemini Flash (Com RAG)", "file": "predicted_gemini_flash_rag_default.txt"},
+    {"name": "Gemini Flash Lite (Sem RAG)", "file": "predicted_gemini_flash_lite_rag_none.txt"},
+    {"name": "Gemini Flash Lite (Com RAG)", "file": "predicted_gemini_flash_lite_rag_default.txt"}
 ]
 
 # ==========================================
-# 2. Output Parser
+# 2. Output Parser (VersÃO CORRIGIDA)
 # ==========================================
-def parse_spider_output(output_text):
+def parse_spider_output_detailed(output_text):
     """
-    Reads the raw terminal text output from the Spider evaluation script
-    and extracts the final 'all' scores from the last column of the table.
+    Lê a tabela do Spider e extrai as notas de TODAS as dificuldades corrigindo as colunas.
     """
-    ex_score = "Error"
-    em_score = "Error"
+    scores = {
+        "EX": {"easy": "0.000", "medium": "0.000", "hard": "0.000", "extra": "0.000", "all": "0.000"},
+        "EM": {"easy": "0.000", "medium": "0.000", "hard": "0.000", "extra": "0.000", "all": "0.000"}
+    }
     
     lines = output_text.split('\n')
     current_section = None
@@ -38,29 +43,31 @@ def parse_spider_output(output_text):
         elif "EXACT MATCH" in line:
             current_section = "EM"
             
-        # O Spider imprime linhas como: "execution  0.800  0.700  0.600  0.500  0.650"
-        # A última coluna é a média geral ("all")
-        elif current_section == "EX" and line.startswith("execution"):
+        # A linha com os resultados reais começa com "execution" ou "exact"
+        if current_section == "EX" and line.strip().startswith("execution"):
             parts = line.split()
             if len(parts) >= 6:
-                ex_score = parts[-1].strip()
+                scores["EX"]["easy"] = parts[1]
+                scores["EX"]["medium"] = parts[2]
+                scores["EX"]["hard"] = parts[3]
+                scores["EX"]["extra"] = parts[4]
+                scores["EX"]["all"] = parts[5]
                 
-        elif current_section == "EM" and line.startswith("exact"):
+        elif current_section == "EM" and line.strip().startswith("exact"):
             parts = line.split()
             if len(parts) >= 6:
-                em_score = parts[-1].strip()
-                
-    return ex_score, em_score
+                scores["EM"]["easy"] = parts[1]
+                scores["EM"]["medium"] = parts[2]
+                scores["EM"]["hard"] = parts[3]
+                scores["EM"]["extra"] = parts[4]
+                scores["EM"]["all"] = parts[5]
+                    
+    return scores
 
 # ==========================================
 # 3. Execution Engine
 # ==========================================
 def run_spider_evaluator(prediction_file):
-    """
-    Uses subprocess to run the official evaluation.py script 
-    as if it were typed in the terminal.
-    """
-    # CORRIGIDO: Removido o 'command =' duplicado
     command = [
         sys.executable, "-X", "utf8", "evaluation.py",
         "--gold", GOLD_SQL_FILE,
@@ -71,57 +78,61 @@ def run_spider_evaluator(prediction_file):
     ]
     
     try:
-        # Run the command
         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", check=True)
-        return parse_spider_output(result.stdout)
+        return parse_spider_output_detailed(result.stdout)
     except subprocess.CalledProcessError as e:
-        print(f"\n[!] Failed to evaluate {prediction_file}. Error details:")
-        # ADICIONADO: Às vezes o Spider joga erros lógicos no stdout, não no stderr
+        print(f"\n[!] Falha ao avaliar {prediction_file}. Detalhes do erro:")
         print(e.stderr if e.stderr else e.stdout) 
-        return "Error", "Error"
+        return None
     except FileNotFoundError:
-        print("\n[!] Error: 'evaluation.py' not found. Please download it from the Spider GitHub.")
-        return "Error", "Error"
+        print("\n[!] Erro: 'evaluation.py' não encontrado na pasta raiz.")
+        return None
 
 # ==========================================
 # 4. Main Pipeline
 # ==========================================
 def main():
-    print("Starting automated evaluation pipeline...")
+    print("Iniciando avaliação detalhada (Estudo de Ablação)...\n")
     results_data = []
     
     for model in MODELS_TO_EVALUATE:
         model_name = model["name"]
         pred_file = model["file"]
         
-        # Check if the text file from Phase 3 actually exists before running
         if not os.path.exists(pred_file):
-            print(f"Skipping {model_name}... File '{pred_file}' not found.")
+            print(f"⚠️ Pulando {model_name}... Arquivo '{pred_file}' não encontrado.")
             continue
             
-        print(f"Evaluating {model_name}...")
-        ex_score, em_score = run_spider_evaluator(pred_file)
+        print(f"📊 Avaliando {model_name}...")
+        scores = run_spider_evaluator(pred_file)
         
-        results_data.append({
-            "Model": model_name,
-            "Execution Accuracy (EX)": ex_score,
-            "Exact Match (EM)": em_score
-        })
-        print(f"--> Result: EX = {ex_score} | EM = {em_score}")
+        if scores:
+            results_data.append({
+                "Model": model_name,
+                "EX_Easy": scores["EX"]["easy"],
+                "EX_Medium": scores["EX"]["medium"],
+                "EX_Hard": scores["EX"]["hard"],
+                "EX_Extra": scores["EX"]["extra"],
+                "EX_All": scores["EX"]["all"],
+                "EM_Easy": scores["EM"]["easy"],
+                "EM_Medium": scores["EM"]["medium"],
+                "EM_Hard": scores["EM"]["hard"],
+                "EM_Extra": scores["EM"]["extra"],
+                "EM_All": scores["EM"]["all"]
+            })
+            print(f"   [GERAL] EX = {scores['EX']['all']} | EM = {scores['EM']['all']}")
+            print(f"   [FÁCIL] EX = {scores['EX']['easy']} | [EXTRA DIFÍCIL] EX = {scores['EX']['extra']}\n")
         
-    # Write everything to a clean CSV for the thesis
-    csv_filename = "evaluation_metrics.csv"
+    csv_filename = "evaluation_metrics_ablation_study.csv"
     if results_data:
         with open(csv_filename, "w", newline="", encoding="utf-8") as f:
-            headers = ["Model", "Execution Accuracy (EX)", "Exact Match (EM)"]
+            headers = ["Model", "EX_Easy", "EX_Medium", "EX_Hard", "EX_Extra", "EX_All", 
+                       "EM_Easy", "EM_Medium", "EM_Hard", "EM_Extra", "EM_All"]
             writer = csv.DictWriter(f, fieldnames=headers)
-            
             writer.writeheader()
             writer.writerows(results_data)
             
-        print(f"\nPipeline finished! Metrics successfully saved to '{csv_filename}'.")
-    else:
-        print("\nPipeline finished, but no data was generated.")
+        print(f"🎉 Pipeline concluído! Métricas salvas na super planilha '{csv_filename}'.")
 
 if __name__ == "__main__":
     main()
